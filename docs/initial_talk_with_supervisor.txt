@@ -1,0 +1,118 @@
+Speakers: 
+Davide Buscaldi : DB
+Andrei Stirbu (me) : AS
+DB: Okay, this is a... We build a language-language model from scratch. So this is a book that explains the transformer. So it... You have the code for a transformer model for text. So with the code examples. Yeah. So in your case, what are sentences become tracks? And you need to predict instead of next word what will be the next point. So basically you need a data set like the one that I sent you and you try to build a transformer that predicts next point instead of predicting next word. So this will be theoretically the target. So I don't know how well this could work. And especially there are some baselines that you can do. You can do like a math formula that takes the average speed of the last two points and the route and predicts like the next point and see if your model is able to do better than that for existing tasks. So you take care. 
+
+AS: But that's just to compare performance at the end, right? 
+
+DB: - Yeah. So, okay, let me see. So is there something that is not clear to you? - No, it's okay, so far. 
+
+AS: But so I see, so here you've given me data sets for reported piracy events, AIS data for vessel encounters near miss events, US coastal waters, wave height and environmental data. But where can I get data like speed of the ship, type of the ship? - 
+
+DB: Yes, so this is, the main problem is what friend, This kind of data. I think I need a bookmark. Sorry, I have like a one trillion bookmarks. [LAUGHTER] So there is this dataset, which is also synthetic, but it's not that bad because it is still realistic. So this is data set for collisions, but it's not that important because in any case the objective is to create... Is this the one that I sent you? Let me check. I think I sent you another one. 
+
+AS: I don't think I have this. So I have vessel proximity events. 
+
+DB: Oh yes, I think it is the one. Yes, because there is this option for the routes, but there is also the marine cadastra. Yeah, so this is only for United States, but, yes, the track lines. So this is smaller. There are less points. This is bigger, but there is a lot more processing from this data because these blocks are very large because they have downloaded all ships that were in the coastlines of United States for every year since 2009. So if you take one of these files, how big it is? Yes, seven gigabytes. You have to go through these files. It is fairly a lot. But it is not impossible in the sense that I have also some scripts that I can extract a route, a track from here. But I think it's faster because here you have less data. It is not bad that you have more data, but to start just to see if it is working, maybe you can start working with less data. So you have vessel ID, timestamp, longitude, latitude, should the heading course speed do. This is will be like the points that you are going to predict. So the model would be autoregressive because what you need to learn is, so you need to predict the same thing for the next step. So you have longitude, latitude for the next step.  Adding course. So maybe adding course and speed, you should drop them initially because you have just the track. You don't have vessel type, I don't know if there is any information about some proximity; for now is not important. The idea would be that you can generate a new track from those that you have seen in the data and it could be possible that you have to cross your data with additional information like when there are coastlines. So I think that here you have just the tracks. So you don't have the coastlines. But they're richer today, they explain. No, OK. They don't have any. the pi LSTM. So they generate with a model which is called LSTM. That is another neural model but is older. I don't know if I passed you this paper (A Scalable System for Maritime Route and Event Forecasting.pdf - in the project docs)but it could be interesting to take a look because basically you can do something similar but replacing LSTM with transformers. I can send you a link to this if you want. Just to take a look at what you can do with all of this. Eventually if you need the meteorological sea information, you can have data from here. But before you go and looking for more data, I would say let's see what you can do like with the basic. 
+
+AS: Okay, so we start and then we scale the input of the model. So we do coordinates first and then we do speed and then at some point we also plot the coastline. 
+
+DB: For now, I would say the first priority is to adapt this transformer idea to work with the trajectories. In input, we give just the trajectories and we see what happens. What happens means that you take the training data that we use from here. you take this data, so you take just the coordinates. You recreate the path, so you need to recreate for this ship, so a path is identified because you have the same ID. So you need to group by the ID. So you take this part as training, and you adapt this. So initially you may like have your vector that you give in input is just these two values. So longitude and latitude. And you give them an input to this model and see if it is able to predict. So you need to work on the model to modify what will be at the end. So it means also that I need you to give a transformer implementation. (here we are talking about the contents of the .ipynb file i put in the project files). I have one that we have in one of our labs. Um, let me see. Yeah, but, so I don't know if you want, I can translate, or I think I have also one. I can read it in terms, it's okay. Okay. So here you have an implementation of transform. So actually this part probably you can't drop it because this is the positional encoding and so positional in the text. So it means when you see a word in the beginning, this does make much sense in this case because you're already at the position. So I'm not sure that you really need this part. So transformer model, okay. So if you remove the position encoding, you can remove the position encoder. So this part is not necessary. At least you can see what happens if you leave it to not. So you need to predict the classification and weights. Okay. This is what you need to change also because you don't want to predict the classification to classify, but you want to predict the two values that are the coordinates. So you need to change this. So I don't know if you have seen PyTorch already. Yeah. Okay, so this is a linear layer that take From the input and bindings to a number of classes. So you need to change Instead of predicting over a number of classes you need to predict over the coordinate. Yeah, over a set of coordinates. Yeah and So this means also that you need to modify the loss of the classifier But and so the next coordinates I take them For example, I divide the whole planet, so to say, in green, and I'll put the next square where it's going to go. Or do I, from my actual position, just trace a circle over a certain radius and say, "Okay, I take 10 points on the circle, even in distributing, in which of these points is it more likely to go?" Yes, well, it actually depends. If you want to keep it as a classification problem, what you have to do is to classify between the inside of a grid. So you can take a grid that is small and maybe it's centered around the last position, so it is not very difficult. It is actually an open problem about how do we formulate this, because I think it's a the first time that someone is going to try to do this. So either you predict the single values and then it becomes a regression problem because instead of predicting a category, you want to predict, do you know what is the difference between classification and regression? 
+
+AS: - Yeah. - So regression is you predict a value. Classification means that you have a set of choices. And you predict one of the choices. 
+
+DB: So in this case, I don't know if it is better to have a grid and you predict a square or you predict directly the coordinates. So this is something to explore. Okay. So, of course, if you have a grid, then you can use this, but it is important that you understand what would be the classes because in this case would be some place, some of the boxes in the grid. Yeah. Okay, so this part, vocabulary tokenization, it is not of interest to you because we would use this for words, but in our case we don't have words. Yeah, I don't have to include anything. Data set, okay. Okay, well data set in this case would be text, but you have tracks. So your tracks are sentences. Okay, so cross entropy. So this is what you need to change. So if you keep a classification scenario, it is cross entropy. But if it is a regression scenario, you should use a mean squared error. So, so you should have a loss of these cancels. The mean squared error is basically the difference between your predicted point and the actual point squared. So it is, you need to change. So you replace the cross-entron unit. And that's all, so you have also the training loop. So you can start from the, this is a very simple transformer, but I think that you don't need to use a, because this one has many, two under and endings for layers to add. I guess it is enough because these are not words. This is simpler than words. I think if you keep it simple, it should be okay. I pass you on to this file. 
+
+AS: Thank you. And so I started from coordinates from two coordinates and then based on how it goes, I add more and more features. 
+
+DB: Yeah. Yeah. That could be an idea. Another idea is that we take the grid, you split the space in a grid and you name the points. So like, so this become actually a test for the, Okay, thanks. Okay, so every grid element you give it a name. So this is AA, this is AB. 
+
+AS: Like an excel, but it's not. 
+
+DB: Exactly. So your grid, I don't know how much, so it could be like one kilometer or something, less. So you split the space that we are working on. (now we re talikng on some drawings we are maiking on a blackboard) So imagine this is a Greek island. You split the space into grids. And so this route means basically that you are going from point A B two pointers, so this will be C D okay and the two pointer So you discretize your space and then basically your transformer instead of sending the coordinates you say And what is going to predict is going to predict the next letters yeah, so the basically are the course you transform the coordinates into words then the words represent the spacing 
+
+AS: But doesn't this only work if I have two coordinates so if I do for example speed here or time or whatever 
+
+DB: Yeah, well if you discretize Actually you can derive the speed like from Calculating the delta between the points because initially you have the to build a grid that you need to start from 
+
+AS: Yeah, but I still have time or 
+
+DB: Yeah, you have that but If you use this method for now, you drop them away or you can add them to embedding the tube tape from the world So for speed I encoded with another letter No First of all, so these letters becomes a vector. Okay, and this is done automatically by the model because if you take the the transformer The transform, the first thing that it does is to make an embedding from the grid to hidden. So this embedding is what does this. So this is transformed into a vector that is sides and hidden. So this would be and hidden. And this is just basing on the letters. If you want to add more, you can cut an edge here. 
+
+AS: Okay, so if I do speed next, I can just... 
+
+DB: Yeah, but you have to normalize between zero and one because otherwise it won't work. Because you have a network only take weight between zero. Take a look. So I give you this. You can try this idea that I showed you. It is interesting because it is very closely related to text. But also the idea of working directly with coordinates could be good. But I don't know if there is no paper. Maybe it does work. But I cannot tell. 
+
+AS: But is this something that could be made into a paper? 
+
+DB: What do you mean? 
+
+AS: The work that I do here, is this something that can be published? 
+
+DB: If you want to publish, yes, there is more work that can be published. I would prefer we like to publish. Yes, absolutely. This is something that no one has done before. This is also one of the reasons for which I am trying this new domain, because it is new. Okay, so I was looking for... Yes, the script for the transformer. Important information, this works only on Python 3.12. Sorry if you run it, because there was a problem with the 13... 3.13? Yes, because there is a tensor flow that doesn't work on the 13. Yes, a tensor flow. Okay, but don't I do here PyTorch mostly? Yes, yes, yes, but PyTorch you have back end, it could be TensorFlow back end, can bug with TensorFlow back end. Okay. and so the codes... codes... Now we're looking for whether I have them. Okay, quotes. TD6 and... Okay, so I think you have everything. So I would say first of all, you try to implement the transformer, maybe you try the grid, the one that is... You need to change almost anything here, just data pre-processing. But these points are not in grid... You have to build the grid, that is something that you have to do. So you have to build the grid and transform the points latitude, longitude into points position on the grid. 
+
+AS: And should I, okay, for the approximation, do I take for a square and a grid the corners? Do I take these points, the intersections, or the square themselves? So I say, okay, this point is here. 
+
+DB: You can take the center of the points, maybe. 
+
+AS: Oh, okay, so the center of the squares? Okay, and then, so my approximation is going to be one of those... 
+
+DB: Yeah, you have, I don't know, 200 meters for each side of the ship or something like that. Well, I think it also depends on the timestamp. If there are two clues, but if the ship is static or is moving very slowly, it's not a problem if you keep predicting the same square, because it means that it is not moving. Yeah, but if the ship is moving fast, isn't it possible? Okay, so it's moving fast and it does not report very often, so I have big time. Yes, you have a lot of gaps. Yeah, it's going to jump out of my range. Yeah, but the idea is that you have a grid that covers all the zone that you are covering. So like in your case of infarction. 
+
+AS: But actually in my case it doesn't matter yet because I don't have speed. I only have coordinates. 
+
+DB: Yeah, for now we have just the coordinates. But you see this. So theoretically you should be the grid that covers all these squares and you have like square aa would be what I don't know if it makes sense to put aa here but it is like you need like basically to discretize this and put the roots into small squares so this is all you have to do and then you give a name to the squares. 
+
+AS: So I still do the ABCD. 
+
+DB: Yeah, but so you need like maybe you can focus here and cover here But of course if you focus here and this is your world you will not be able to predict these ones Okay, so you need to cover everything Of course, it does make sense to have Vocabulary to cover zones that are land. So I don't know how to ...
+
+AS: - I think we can just have the grid and for all land we just encode it by ZZ or XX? 
+
+DB: - It could be a solution, yes. It is like padding, it is something that  It is zero, basically.  But everything that is sea, you should keep... 
+
+AS: Yeah, this is the idea. 
+
+DB: So let's see if it works, and I hope it works.  So we can start with the code that is basically you use the same structure of the transformer because instead of predicting next word, you predict the next coordinate in text or form. So then you remap these coordinates into let alone that is the center of the block. But the letters, is it just one word or is it like A, comma A? I would put them together. Yes, like they are... But then, if I... In code, for example, let's say from here to here, I have to capture everything, I don't have... I don't have enough letters, because if I divide this into 24, it's going to give me very big. So I'm going to pass... Ah, yes. No, 24. I'm going to pass A to Z, and I'm going to have... Yes, you're right. We don't have enough letters. But you can make words like... So like everything that is in the first row...  It could be that... You can add numbers. So the idea is that you keep the idea that you have like a word that represents the square. So if you have, you can switch to numbers. Okay so I can maybe encode them 1a, 2a, sorry 1b all the way to 1z and then go 2a. Yes it could be something like that. And then if I have 7B, 16C? Yeah, or... Yes, it must be... The point is it must be consistent. Like, there is a clear rule and like that you can also like identify from the code if you are like in this area or south. It could also be hierarchical. There are some... How is it cooled? (footsteps You have this kind of stuff. It is used sometimes in strategy games. Excuse me. Hexagonal efficiency coordinate system? Yes, because you have...but in this case you lose the letters, but you have numbers, but it is like a code. So you have a unique code for every hexagon. 
+
+AS: But this is similar to what they did in the paper, right? In the paper you showed me, they also did hexagonal split on the... - 
+
+DB: Yes, because the hexagon is the best way you can cover any kind of surface with the exact area. Yeah, I don't know, we can try. You can like start with this one example and see like you take it where it is more dense and you do the grid only here and you see if it is able to work on that zone and then we can try to expand on the rest of the area. The important thing is that we can have a unique ID code for every execution. So if you can do that, then it is easy. - Okay. 
+
+AS: - It can be a hash function. You can hash positions into a word code. Yeah, okay. -
+
+DB: Also, okay, so it's hash function. HECS, right? And then... Okay. 
+
+AS: But isn't the curvature of the water is the problem? No. This scale is not important. It's not... Because the problem is if I map the whole... 
+
+DB: Global, yeah, but no one is going to do that because it drew too much data, too much complex. Usually, you do this prediction in the local. You never do a global route prediction. But then... 
+
+AS: Okay, but so then if I only want for one ship, then can I just not take for each of the ships its path, and then for sure I'm gonna fit in this A to Z, like these two letters. Yeah, because if I don't plan to map the whole thing from the start and I just map it for one Then map it for the other so I map each of them individually 
+
+DB: Yeah, but the problem is that you need your set of data to be consistent in the sense every ship they pass through the same block You need to code the block in the same way 
+
+AS: But I still need a global 
+
+DB: Yeah, but you can like Instead of have a full grid you just do this and so that the only the only other problem is we need to have a name for the blocks so that is so it could be a code the unique code That you can obtain in different ways or can be even a word a random generated word The only problem of the random generated word is that you lose the coordinates between Yeah And the whole database to store everything. Yes, well. But, okay, this data is not very large. It is relatively 2 megabytes. It's okay. Yeah, but this... Okay. If you want to work on this set, I can give you the script that I did. But I think, you know Mark Sade? Yeah, I know he's also doing this. working on this problem maybe he has a script to extract tracks from here. The idea, the application of your work would be to generate scenarios. So that you can have a track and... we can eventually include then when we see that this work, we can include the meteorological information to see if you can produce roots that are altered by, I don't know, the presence of adverse weather or currents, you know. So you can say, I want to generate a root that simulates what ships would do if there is like a storm in this position. So usually they should go around. Usually if you go around, you don't go around in front because if it accelerates, you will be caught. So usually you go around, but behind the storm. But a sailor knows it, but a model has to learn it. Okay, so I think you have enough to start and information. If something is unclear, let me know. 
+
+AS: Okay, but just for the global encoding, do I still keep the... I'm still not sure how to encode the whole thing. If letters are not enough, we can think about... So, like... Or should I just do pairs of coordinates first and then... 
+
+DB: It could be like if you have a sheet from Excel or like a sheet if you make a Google sheet. So theoretically you have infinite cells. So once you get Z you can go AA. So theoretically you can do the same. So knowing that if you have like, yes, you can also like try coding like Google, like spreadsheet. You have a rosy number and column in the inductor. So you have this cell is A2, this is B2, C2. And it's going to be AB17. Yeah, for instance. So you can like use this kind of coding for the... So when you finish Z, you go AA, when you finish ZZ, you go AAA, and so on. So you can have very long strings, but at least they are unique. 
+
+AS: But I still have, I don't think it gets very long because in order to get to AAA, I need to do ZZ, which is 26 squared. And to get to four letters, I will have to the power of three. I think it will be okay. 
+
+DB: You can try this kind of coding. The spreadsheet coding. See if it works. 
+
+AS: Okay. So I'll make a GitHub repo maybe to put everything all the code or documents there. And send it to you.  
+
+DB: If you have any questions, you can write. 
+
+AS:  And also about publishing? 
+
+DB: Once we have the results and if they are good, we can try to find a venue to publish the work. If you have something that is used about for a paper you can write it down and you can find a venue to submit. It depends also on the kind of results that you have. We'll see what you get and then we can find a place where to publish. 
+
+AS: Because I know that if I'm working towards something publishable, there's like maybe certain directions I have to take. 
+
+DB: Yeah, it's possible. But first of all, let's see if it works and if it works. I have some ideas about possible conferences. We look at the deadline. Because sometimes maybe the deadline is after your defense. 
+
+AS: But it's fine for me, it's no problem.
