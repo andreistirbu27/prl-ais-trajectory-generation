@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -40,6 +41,27 @@ def get_device() -> torch.device:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+@dataclass
+class Scaler1D:
+    """Scaler for 1D values (e.g. log(dt))."""
+    mean: float
+    std: float
+
+    @staticmethod
+    def fit(x: np.ndarray) -> "Scaler1D":
+        mean = float(x.mean())
+        std = float(x.std())
+        if std < 1e-6:
+            std = 1.0
+        return Scaler1D(mean=mean, std=std)
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        return ((x - self.mean) / self.std).astype(np.float32)
+
+    def inverse(self, x: np.ndarray) -> np.ndarray:
+        return x * self.std + self.mean
 
 
 @dataclass
@@ -107,7 +129,7 @@ def load_tracks(
     lon_col: str = "LON",
     max_jump_degrees: float = 1.0,
     verbose: bool = True,
-) -> Dict[str, np.ndarray]:
+) -> Tuple[Dict[str, np.ndarray], Dict[str, "pd.Timestamp"]]:
     """Load vessel tracks from CSV with validation.
     
     Args:
@@ -120,7 +142,8 @@ def load_tracks(
         verbose: Print loading statistics
     
     Returns:
-        Dictionary mapping vessel_id -> trajectory array of shape (T, 2) with [lon, lat]
+        Dictionary mapping vessel_id -> trajectory array of shape (T, 3) with [lon, lat, dt_seconds].
+        dt_seconds[0] is always 0 (no elapsed time before the first point).
     """
     df = pd.read_csv(csv_path)
     
@@ -145,6 +168,7 @@ def load_tracks(
     df = df.sort_values([id_col, time_col])
     
     tracks: Dict[str, np.ndarray] = {}
+    tracks_first_ts: Dict[str, pd.Timestamp] = {}
     validation_stats = {
         'total_vessels': 0,
         'valid_vessels': 0,
@@ -176,9 +200,15 @@ def load_tracks(
                 print(f"  Skipping vessel {v_id}: {reason}")
             continue
         
-        # Store as [lon, lat] in float32
-        pts = np.stack([lon, lat], axis=1).astype(np.float32)
+        # Compute dt_seconds (time elapsed since previous point; 0 for the first)
+        ts = g[time_col].to_numpy()
+        dt = np.concatenate([[0.0], np.diff(ts.astype("datetime64[s]")).astype(float)])
+
+        # Store as [lon, lat, dt_seconds] in float32
+        pts = np.stack([lon, lat, dt], axis=1).astype(np.float32)
         tracks[str(v_id)] = pts
+        # Record first timestamp for temporal splitting
+        tracks_first_ts[str(v_id)] = g[time_col].iloc[0]
         validation_stats['valid_vessels'] += 1
     
     if verbose:
@@ -196,7 +226,7 @@ def load_tracks(
             lengths = [len(t) for t in tracks.values()]
             print(f"  Track lengths: min={min(lengths)}, max={max(lengths)}, mean={np.mean(lengths):.1f}")
     
-    return tracks
+    return tracks, tracks_first_ts
 
 
 def train_val_split(tracks: Dict[str, np.ndarray], val_frac: float, seed: int):
@@ -213,11 +243,28 @@ def train_val_split(tracks: Dict[str, np.ndarray], val_frac: float, seed: int):
     return train, val
 
 
+def temporal_train_val_split(
+    tracks: Dict[str, np.ndarray],
+    tracks_first_ts: Dict[str, "pd.Timestamp"],
+    val_date: str,
+):
+    """Split tracks by date: vessels whose first point is before val_date go to train,
+    vessels whose first point is on or after val_date go to val.
+
+    This tests generalization to unseen future dates rather than unseen vessels
+    from the same time period.
+    """
+    cutoff = pd.Timestamp(val_date)
+    train = {k: v for k, v in tracks.items() if tracks_first_ts[k] < cutoff}
+    val   = {k: v for k, v in tracks.items() if tracks_first_ts[k] >= cutoff}
+    return train, val
+
+
 class TrajectoryDataset(Dataset):
     """Sliding windows from vessel trajectories.
-    
+
     Each sample contains:
-        source_sequence: (seq_len, feature_dim) - input features
+        source_sequence: (seq_len, feature_dim) - input features [lon, lat, log_dt, (vel_lon, vel_lat)?]
         target: (seq_len, 2) - target positions [lon, lat]
     """
 
@@ -225,6 +272,7 @@ class TrajectoryDataset(Dataset):
         self,
         tracks: Dict[str, np.ndarray],
         scaler: Scaler2D,
+        scaler_dt: Scaler1D,
         seq_len: int = 20,
         stride: int = 1,
         max_windows_per_track: Optional[int] = None,
@@ -232,6 +280,7 @@ class TrajectoryDataset(Dataset):
     ):
         self.tracks = tracks
         self.scaler = scaler
+        self.scaler_dt = scaler_dt
         self.seq_len = seq_len
         self.stride = stride
         self.use_velocity = use_velocity
@@ -253,27 +302,25 @@ class TrajectoryDataset(Dataset):
 
     def __getitem__(self, index: int):
         v_id, s = self.index[index]
-        pts = self.tracks[v_id][s : s + self.seq_len + 1]  # (seq_len+1, 2)
-        
-        # Input: points 0 to seq_len-1
-        # Target: points 1 to seq_len
-        x_pos = pts[:-1]  # (seq_len, 2) - positions
-        y = pts[1:]       # (seq_len, 2) - target positions
-        
-        # Normalize positions
-        x_pos_norm = self.scaler.transform(x_pos).astype(np.float32)
+        pts = self.tracks[v_id][s : s + self.seq_len + 1]  # (seq_len+1, 3): [lon, lat, dt]
+
+        # Input: points 0 to seq_len-1; Target: points 1 to seq_len
+        x_raw = pts[:-1]  # (seq_len, 3)
+        y = pts[1:, :2]   # (seq_len, 2) - target [lon, lat] only
+
+        # Normalize position and time
+        x_pos_norm = self.scaler.transform(x_raw[:, :2])          # (seq_len, 2)
+        log_dt = np.log1p(np.clip(x_raw[:, 2], 0, None))          # (seq_len,)
+        log_dt_norm = self.scaler_dt.transform(log_dt)[:, None]    # (seq_len, 1)
         y_norm = self.scaler.transform(y).astype(np.float32)
-        
+
         if self.use_velocity:
-            # Compute velocities (difference between consecutive positions)
-            vel = np.diff(pts[:-1], axis=0, prepend=pts[0:1])  # (seq_len, 2)
-            vel_norm = vel / self.scaler.std  # Normalize by std only
-            
-            # Concatenate: [pos_lon, pos_lat, vel_lon, vel_lat]
-            x = np.concatenate([x_pos_norm, vel_norm.astype(np.float32)], axis=1)
+            vel = np.diff(x_raw[:, :2], axis=0, prepend=x_raw[0:1, :2])  # (seq_len, 2)
+            vel_norm = (vel / self.scaler.std).astype(np.float32)
+            x = np.concatenate([x_pos_norm, log_dt_norm, vel_norm], axis=1)  # (seq_len, 5)
         else:
-            x = x_pos_norm
-        
+            x = np.concatenate([x_pos_norm, log_dt_norm], axis=1)  # (seq_len, 3)
+
         return {
             "source_sequence": torch.tensor(x),
             "target": torch.tensor(y_norm)
@@ -291,6 +338,7 @@ def MyCollator(batch):
 def get_loader(
     tracks: Dict[str, np.ndarray],
     scaler: Scaler2D,
+    scaler_dt: Scaler1D,
     seq_len: int,
     batch_size: int,
     stride: int = 1,
@@ -303,6 +351,7 @@ def get_loader(
     dataset = TrajectoryDataset(
         tracks=tracks,
         scaler=scaler,
+        scaler_dt=scaler_dt,
         seq_len=seq_len,
         stride=stride,
         max_windows_per_track=max_windows_per_track,
@@ -600,15 +649,32 @@ def eval_constant_velocity_baseline(loader: DataLoader, device: torch.device, sc
     }
 
 
+def get_cosine_schedule_with_warmup(
+    optimizer: torch.optim.Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+) -> LambdaLR:
+    """Linear warmup then cosine annealing LR schedule."""
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return LambdaLR(optimizer, lr_lambda)
+
+
 def train(
     model: Model,
     optimizer: torch.optim.Optimizer,
     loader: DataLoader,
     device: torch.device,
+    scheduler: Optional[LambdaLR] = None,
     log_interval: int = 20,
     current_epoch: int = 1,
     grad_clip: float = 0.5,
-    use_causal_mask: bool = False,
+    use_causal_mask: bool = True,
 ):
     """Train model for one epoch."""
     model.train()
@@ -621,7 +687,7 @@ def train(
         src, target = data  # (seq_len, batch_size, feature_dim), (seq_len, batch_size, 2)
         src = src.to(device)
         target = target.to(device)
-        
+
         src_mask = None
         if use_causal_mask:
             src_mask = model.base.generate_square_subsequent_mask(src.size(0)).to(device)
@@ -630,15 +696,19 @@ def train(
 
         loss = mse_fn(output, target)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += float(loss.item())
 
         if idx % log_interval == 0 and idx > 0:
             cur_loss = total_loss / log_interval
+            lr = scheduler.get_last_lr()[0] if scheduler else optimizer.param_groups[0]["lr"]
             print(
-                f"| epoch {current_epoch:3d} | {idx:5d}/{len(loader):5d} steps | mse {cur_loss:8.6f}"
+                f"| epoch {current_epoch:3d} | {idx:5d}/{len(loader):5d} steps"
+                f" | mse {cur_loss:8.6f} | grad {grad_norm:.3f} | lr {lr:.2e}"
             )
             total_loss = 0.0
 
@@ -661,8 +731,8 @@ def main():
                        help="Max allowed jump between points (degrees, ~111km)")
     
     # Sequence args
-    parser.add_argument("--seq_len", type=int, default=10,
-                       help="Sequence length (REDUCED from 20 to 10)")
+    parser.add_argument("--seq_len", type=int, default=20,
+                       help="Sequence length (context window for the transformer)")
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--max_windows_per_track", type=int, default=None)
     
@@ -671,7 +741,12 @@ def main():
                        help="Add velocity features to input")
     
     # Split
-    parser.add_argument("--val_frac", type=float, default=0.1)
+    parser.add_argument("--val_frac", type=float, default=0.1,
+                        help="Fraction of vessels for validation (used when --val_date is not set)")
+    parser.add_argument("--val_date", type=str, default=None,
+                        help="If set (e.g. '2024-03-28'), vessels whose first point is on or "
+                             "after this date go to val; all others go to train. "
+                             "Use this for multi-day data (recommended over --val_frac).")
     parser.add_argument("--seed", type=int, default=0)
     
     # Model args
@@ -679,10 +754,12 @@ def main():
     parser.add_argument("--nhid", type=int, default=128)
     parser.add_argument("--nlayers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--use_positional_encoding", action="store_true",
-                       help="Use sinusoidal positional encoding")
-    parser.add_argument("--use_causal_mask", action="store_true",
-                       help="Use causal mask (default: bidirectional attention)")
+    parser.add_argument("--no_positional_encoding", action="store_false", dest="use_positional_encoding",
+                       help="Disable sinusoidal positional encoding (enabled by default)")
+    parser.set_defaults(use_positional_encoding=True)
+    parser.add_argument("--no_causal_mask", action="store_false", dest="use_causal_mask",
+                       help="Disable causal mask / use bidirectional attention (causal is default)")
+    parser.set_defaults(use_causal_mask=True)
     
     # Training args
     parser.add_argument("--batch_size", type=int, default=256)
@@ -701,7 +778,7 @@ def main():
     print("="*60)
     print("LOADING DATA")
     print("="*60)
-    tracks = load_tracks(
+    tracks, tracks_first_ts = load_tracks(
         args.csv,
         id_col=args.id_col,
         time_col=args.time_col,
@@ -710,32 +787,44 @@ def main():
         max_jump_degrees=args.max_jump_degrees,
         verbose=True,
     )
-    
+
     if len(tracks) == 0:
         raise RuntimeError("No valid tracks loaded. Check your data!")
 
     # Train/val split
-    train_tracks, val_tracks = train_val_split(tracks, args.val_frac, args.seed)
-    print(f"\nSplit: {len(train_tracks)} train vessels, {len(val_tracks)} val vessels")
+    if args.val_date:
+        train_tracks, val_tracks = temporal_train_val_split(
+            tracks, tracks_first_ts, args.val_date
+        )
+        print(f"\nTemporal split on {args.val_date}: "
+              f"{len(train_tracks)} train vessels, {len(val_tracks)} val vessels")
+    else:
+        train_tracks, val_tracks = train_val_split(tracks, args.val_frac, args.seed)
+        print(f"\nRandom split: {len(train_tracks)} train vessels, {len(val_tracks)} val vessels")
 
     if len(train_tracks) == 0:
         raise RuntimeError("No training tracks after split!")
 
-    # Fit scaler on training data
+    # Fit scalers on training data only
     all_train_pts = np.concatenate(list(train_tracks.values()), axis=0)
-    scaler = Scaler2D.fit(all_train_pts)
+    scaler = Scaler2D.fit(all_train_pts[:, :2])   # fit on [lon, lat]
+    log_dt_all = np.log1p(np.clip(all_train_pts[:, 2], 0, None))
+    scaler_dt = Scaler1D.fit(log_dt_all)
     print(f"\nScaler fitted:")
-    print(f"  Mean (lon, lat): [{scaler.mean[0]:.4f}, {scaler.mean[1]:.4f}]")
-    print(f"  Std  (lon, lat): [{scaler.std[0]:.4f}, {scaler.std[1]:.4f}]")
+    print(f"  Mean (lon, lat):   [{scaler.mean[0]:.4f}, {scaler.mean[1]:.4f}]")
+    print(f"  Std  (lon, lat):   [{scaler.std[0]:.4f}, {scaler.std[1]:.4f}]")
+    print(f"  Mean log(dt):      {scaler_dt.mean:.4f}")
+    print(f"  Std  log(dt):      {scaler_dt.std:.4f}")
 
-    # Determine input dimension
-    input_dim = 4 if args.use_velocity else 2
-    print(f"\nModel input dimension: {input_dim} {'(pos + vel)' if args.use_velocity else '(pos only)'}")
-    
+    # Determine input dimension: [lon, lat, log_dt] = 3, + [vel_lon, vel_lat] = 5
+    input_dim = 5 if args.use_velocity else 3
+    print(f"\nModel input dimension: {input_dim} {'(pos + log_dt + vel)' if args.use_velocity else '(pos + log_dt)'}")
+
     # Create data loaders
     train_loader = get_loader(
         tracks=train_tracks,
         scaler=scaler,
+        scaler_dt=scaler_dt,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         stride=args.stride,
@@ -751,6 +840,7 @@ def main():
         val_loader = get_loader(
             tracks=val_tracks,
             scaler=scaler,
+            scaler_dt=scaler_dt,
             seq_len=args.seq_len,
             batch_size=args.batch_size,
             stride=args.stride,
@@ -780,23 +870,30 @@ def main():
     print(f"Causal mask: {args.use_causal_mask}")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=args.lr, 
-        weight_decay=args.weight_decay
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
     )
+
+    total_steps = args.epochs * len(train_loader)
+    warmup_steps = min(int(0.05 * total_steps), 500)  # 5% warmup, capped at 500 steps
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    print(f"LR schedule: cosine with {warmup_steps} warmup steps ({total_steps} total)")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Evaluate baseline
+    # Evaluate baseline before training
+    baseline_metrics = None
     if val_loader is not None:
         print(f"\n{'='*60}")
         print("BASELINE (Constant Velocity)")
         print("="*60)
-        base = eval_constant_velocity_baseline(val_loader, device, scaler)
-        print(f"Val MSE: {base['mse']:.6f} | ADE: {base['ade_m']:.1f}m | FDE: {base['fde_m']:.1f}m")
+        baseline_metrics = eval_constant_velocity_baseline(val_loader, device, scaler)
+        print(f"Val MSE: {baseline_metrics['mse']:.6f} | ADE: {baseline_metrics['ade_m']:.1f}m | FDE: {baseline_metrics['fde_m']:.1f}m")
         print("\nIf your model doesn't beat this baseline, something is wrong!\n")
 
     best_val = float("inf")
+    best_metrics = None
 
     # Training loop
     print(f"{'='*60}")
@@ -808,6 +905,7 @@ def main():
             optimizer=optimizer,
             loader=train_loader,
             device=device,
+            scheduler=scheduler,
             log_interval=20,
             current_epoch=epoch,
             grad_clip=args.grad_clip,
@@ -816,8 +914,8 @@ def main():
 
         if val_loader is not None:
             metrics = eval_regression(
-                model, val_loader, device, scaler, 
-                use_causal_mask=args.use_causal_mask
+                model, val_loader, device, scaler,
+                use_causal_mask=args.use_causal_mask,
             )
             print(
                 f"Eval | epoch {epoch:3d} | val mse {metrics['mse']:.6f} | "
@@ -826,19 +924,21 @@ def main():
 
             if metrics["mse"] < best_val:
                 best_val = metrics["mse"]
+                best_metrics = metrics
                 checkpoint = {
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scaler_mean': scaler.mean,
                     'scaler_std': scaler.std,
+                    'scaler_dt_mean': scaler_dt.mean,
+                    'scaler_dt_std': scaler_dt.std,
                     'args': vars(args),
                     'metrics': metrics,
                 }
                 torch.save(checkpoint, os.path.join(args.out_dir, "best_model.pt"))
                 print(f"  → Saved checkpoint (best val MSE: {best_val:.6f})")
         else:
-            # No validation set, save every epoch
             torch.save(model.state_dict(), os.path.join(args.out_dir, "model.pt"))
 
     print(f"\n{'='*60}")
@@ -846,6 +946,22 @@ def main():
     print("="*60)
     print(f"Best validation MSE: {best_val:.6f}")
     print(f"Models saved to: {args.out_dir}")
+
+    # Final comparison vs baseline
+    if baseline_metrics is not None and best_metrics is not None:
+        print(f"\n{'='*60}")
+        print("FINAL: MODEL vs BASELINE")
+        print("="*60)
+        ade_delta = best_metrics['ade_m'] - baseline_metrics['ade_m']
+        fde_delta = best_metrics['fde_m'] - baseline_metrics['fde_m']
+        ade_pct = 100 * ade_delta / (baseline_metrics['ade_m'] + 1e-9)
+        fde_pct = 100 * fde_delta / (baseline_metrics['fde_m'] + 1e-9)
+        result = "BEATS" if ade_delta < 0 else "LOSES TO"
+        print(f"              ADE (m)     FDE (m)")
+        print(f"  Baseline:  {baseline_metrics['ade_m']:8.1f}   {baseline_metrics['fde_m']:8.1f}")
+        print(f"  Model:     {best_metrics['ade_m']:8.1f}   {best_metrics['fde_m']:8.1f}")
+        print(f"  Delta:     {ade_delta:+8.1f}   {fde_delta:+8.1f}  ({ade_pct:+.1f}% / {fde_pct:+.1f}%)")
+        print(f"\n  Model {result} the constant-velocity baseline.")
 
 
 if __name__ == "__main__":
