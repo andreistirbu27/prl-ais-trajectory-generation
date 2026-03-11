@@ -1,9 +1,30 @@
+# IDE
+.idea/
+.vscode/
+
+# macOS
 .DS_Store
+
+# Python
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
+*.pyo
+*.pyd
 .venv/
 .env
+*.egg-info/
 
+# Jupyter
+.ipynb_checkpoints/
+
+# Conda
+anaconda_projects/
+
+# Data (large files, not tracked)
 data/*
 outputs/*
+runs/*
+
+# Checkpoints
+*.pt
+*.pth

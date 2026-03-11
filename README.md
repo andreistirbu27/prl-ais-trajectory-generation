@@ -3,48 +3,65 @@
 Transformer-based next-step prediction and synthetic maritime trajectory generation from AIS tracklines.
 
 ## Structure
-- src/        core code
-- scripts/    CLI scripts
-- notebooks/  exploration
-- configs/    experiment configs
-- docs/       notes
-- results/    figures/metrics
-- data/       datasets (not tracked)
-- outputs/    checkpoints/preds (not tracked)
+- `scripts/`   CLI scripts (preprocessing + training)
+- `docs/`      supervisor meeting notes and reference papers
+- `data/`      datasets (not tracked)
+- `runs/`      training outputs / checkpoints (not tracked)
 
-ais_prepare.py — AIS Data Preprocessing Pipeline
+## Data Pipeline
 
-Takes a raw AIS CSV, applies a sequence of cleaning filters, writes the
-processed output, and prints a full audit log showing exactly how many rows
-each filter removed and why.
+```
+Raw AIS CSVs (marinecadastre.gov)
+    ↓  scripts/combine_days.py       # merge multi-day files, deduplicate
+    ↓  scripts/process_ais_data.py  # filter by vessel type, bbox, quality
+    →  data/processed/<name>_processed.csv
+```
 
-Usage:
-    python ais_prepare.py data/raw/ais.csv
-    python ais_prepare.py data/raw/ais.csv -o data/processed/ais_clean.csv
-    python ais_prepare.py data/raw/ais.csv --max_jump_km 10 --max_gap_min 30
-    python ais_prepare.py data/raw/ais.csv --min_avg_speed_kmh 1.0
+### Combine multiple raw days
+```bash
+python3 scripts/combine_days.py data/raw/AIS_2024_03_26.csv \
+    data/raw/AIS_2024_03_27.csv data/raw/AIS_2024_03_28.csv \
+    --output data/raw/AIS_combined.csv
+```
 
+### Preprocess (audit log printed to stdout)
+```bash
+python3 scripts/process_ais_data.py data/raw/AIS_combined.csv \
+    -o data/processed/AIS_combined_processed.csv
+```
+Keeps vessel types 60–89 (passenger/cargo/tanker), continental US bbox,
+min 50 points per track, max jump 5 km, max gap 60 min, border truncation filter.
 
+## Training
 
+```bash
+python3 scripts/train_ais_transformer.py \
+    --csv data/processed/AIS_combined_processed.csv \
+    --epochs 20 --val_frac 0.15
 
-train_ais_transformer.py — AIS Vessel Trajectory Prediction
+# With larger model + velocity features:
+python3 scripts/train_ais_transformer.py \
+    --csv data/processed/AIS_combined_processed.csv \
+    --seq_len 20 --d_model 256 --num_layers 4 --epochs 30 --use_velocity
+```
 
-Transformer encoder that predicts the next position for each timestep
-in a sliding window sequence (seq2seq, shifted by 1).
+### Key design decisions
 
-Input features per timestep  : [lon, lat, dt]         (3-dim, default)
-                               + [dlon, dlat]          (5-dim with --use_velocity)
-Target per timestep          : [lon, lat]              (2-dim, shifted +1)
+- **Displacement target** `[dlon_norm, dlat_norm]`, not absolute position.
+  The model learns "how far/which direction" — a small-variance target regardless of where on the coast the vessel is.
+  Absolute next position is recovered at eval: `pred_pos = input_pos + disp_scaler.inverse(pred)`.
+- **Three separate scalers**: position (lon/lat), log(dt), and displacement.
+  Each has its own mean/std, preventing any dimension from dominating the MSE loss.
+- **Causal mask** (default): position t cannot attend to t+1, t+2, … — no future leakage.
+- **Temporal gap mask**: positions with dt > `--max_gap_sec` (default 600 s) are masked so the model cannot attend across large data gaps.
+- **Cosine LR + warmup**: 5% linear warmup then cosine decay.
+- **Constant-velocity baseline** is printed before training. Beat this to show the transformer adds value.
 
-Key design decisions:
-  - Bidirectional attention (no causal mask): consistent with how the model
-    is used at inference time (whole window in, whole shifted window out).
-  - dt (time-delta) as an explicit input feature: your data has variable gaps
-    (mean 102s, p95 181s) so the model needs to know how much time passed.
-  - Cosine LR schedule with linear warmup.
-  - Full checkpoint saves args + scaler + metrics so the model is self-contained.
+### Input / target dimensions
 
-Usage:
-    python train_ais_transformer.py --csv data/processed/ais.csv
-    python train_ais_transformer.py --csv data/processed/ais.csv \\
-        --seq_len 20 --nhid 256 --nlayers 4 --epochs 30 --use_velocity
+| Arg              | Features per timestep                     | Dim |
+|------------------|-------------------------------------------|-----|
+| (default)        | `[lon_norm, lat_norm, log_dt_norm]`       | 3   |
+| `--use_velocity` | above + `[dlon_norm, dlat_norm]`          | 5   |
+
+Target per timestep: `[dlon_norm, dlat_norm]` (normalised displacement to next position)
