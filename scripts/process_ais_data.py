@@ -82,11 +82,12 @@ def _print_report(df: pd.DataFrame, id_col: str, time_col: str,
 def run(args):
     global _initial_rows
 
-    id_col   = args.id_col
-    time_col = args.time_col
-    lat_col  = args.lat_col
-    lon_col  = args.lon_col
-    cols     = [id_col, time_col, lat_col, lon_col]
+    id_col        = args.id_col
+    time_col      = args.time_col
+    lat_col       = args.lat_col
+    lon_col       = args.lon_col
+    vtype_col     = args.vessel_type_col
+    cols          = [id_col, time_col, lat_col, lon_col]
 
     inp = Path(args.input_csv)
     if args.output is None:
@@ -96,8 +97,11 @@ def run(args):
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ── Load ─────────────────────────────────────────────────────────────────
+    # Include vessel type column only when it exists in the file
+    all_cols = pd.read_csv(inp, nrows=0).columns.tolist()
+    load_cols = cols + ([vtype_col] if vtype_col in all_cols else [])
     try:
-        df = pd.read_csv(inp, usecols=cols)
+        df = pd.read_csv(inp, usecols=load_cols)
     except ValueError as e:
         sys.exit(f"ERROR reading CSV: {e}")
 
@@ -107,6 +111,24 @@ def run(args):
     before = len(df)
     df = df.dropna(subset=cols)
     _record("1. Drop missing values", before, len(df))
+
+    # ── 1b. Vessel type filter ───────────────────────────────────────────────
+    # Keep only tankers (80-89), cargo (70-79), passenger (60-69) by default.
+    # Fishing boats and recreational vessels are excluded from route modeling.
+    if args.keep_vessel_types and vtype_col in df.columns:
+        before = len(df)
+        # Parse "60-89" or "70,80,85" style ranges into a flat set of ints
+        allowed: set = set()
+        for part in args.keep_vessel_types.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                allowed.update(range(int(lo), int(hi) + 1))
+            else:
+                allowed.add(int(part))
+        df = df[df[vtype_col].isin(allowed)].reset_index(drop=True)
+        _record("1b. Vessel type filtered", before, len(df),
+                f"kept VesselType in {args.keep_vessel_types}")
 
     # ── 2. Parse timestamps ──────────────────────────────────────────────────
     before = len(df)
@@ -127,6 +149,33 @@ def run(args):
     df = df[lat_ok & lon_ok]
     _record("4. Outside bounding box", before, len(df),
             f"LON [{args.lon_min}, {args.lon_max}]  LAT [{args.lat_min}, {args.lat_max}]")
+
+    # ── 4b. Border-truncated trajectories ────────────────────────────────────
+    # Vessels whose first or last point is within bbox_border_deg of any bbox
+    # edge likely entered/exited the region mid-voyage and have incomplete
+    # trajectories. Drop them to avoid teaching the model that vessels
+    # "teleport" to the boundary.
+    if args.bbox_border_deg > 0:
+        before = len(df)
+        df = df.sort_values([id_col, time_col]).reset_index(drop=True)
+        first_last = df.groupby(id_col).agg(
+            first_lat=(lat_col, "first"), last_lat=(lat_col, "last"),
+            first_lon=(lon_col, "first"), last_lon=(lon_col, "last"),
+        )
+        near_border = (
+            (first_last["first_lat"] - args.lat_min < args.bbox_border_deg) |
+            (args.lat_max - first_last["first_lat"] < args.bbox_border_deg) |
+            (first_last["first_lon"] - args.lon_min < args.bbox_border_deg) |
+            (args.lon_max - first_last["first_lon"] < args.bbox_border_deg) |
+            (first_last["last_lat"] - args.lat_min < args.bbox_border_deg) |
+            (args.lat_max - first_last["last_lat"] < args.bbox_border_deg) |
+            (first_last["last_lon"] - args.lon_min < args.bbox_border_deg) |
+            (args.lon_max - first_last["last_lon"] < args.bbox_border_deg)
+        )
+        truncated_ids = near_border[near_border].index
+        df = df[~df[id_col].isin(truncated_ids)].reset_index(drop=True)
+        _record("4b. Border-truncated trajectories", before, len(df),
+                f"start/end within {args.bbox_border_deg}° of bbox edge")
 
     # ── 5. Duplicate (vessel, timestamp) pairs ───────────────────────────────
     before = len(df)
@@ -222,10 +271,17 @@ def main():
     parser.add_argument("--time_col", default="BaseDateTime")
     parser.add_argument("--lat_col",  default="LAT")
     parser.add_argument("--lon_col",  default="LON")
+    parser.add_argument("--vessel_type_col", default="VesselType",
+                        help="Column name for vessel type codes (default: VesselType)")
+    parser.add_argument("--keep_vessel_types", default="60-89",
+                        help="Comma-separated ranges of VesselType codes to keep. "
+                             "Default '60-89' keeps passenger (60-69), cargo (70-79), "
+                             "tanker (80-89). Set empty string '' to disable.")
 
     # Filter thresholds
-    parser.add_argument("--min_points", type=int, default=20,
-                        help="Min points per vessel track (default: 20)")
+    parser.add_argument("--min_points", type=int, default=50,
+                        help="Min points per vessel track (default: 50). "
+                             "Higher values give the transformer more context to work with.")
     parser.add_argument("--max_jump_km", type=float, default=5.0,
                         help="Max spatial jump between consecutive points in km "
                              "(default: 5.0)")
@@ -235,9 +291,13 @@ def main():
     parser.add_argument("--max_speed_kmh", type=float, default=80.0,
                         help="Max estimated speed between consecutive points in km/h "
                              "(default: 80)")
-    parser.add_argument("--max_stationary_min", type=float, default=10.0,
+    parser.add_argument("--max_stationary_min", type=float, default=5.0,
                         help="Drop consecutive identical positions held longer than "
-                             "this many minutes (default: 10). Set 0 to disable.")
+                             "this many minutes (default: 5). Set 0 to disable.")
+    parser.add_argument("--bbox_border_deg", type=float, default=0.1,
+                        help="Drop vessels whose first or last point is within this "
+                             "many degrees of the bounding box edge — these are "
+                             "truncated mid-trajectory (default: 0.1°). Set 0 to disable.")
     parser.add_argument("--min_avg_speed_kmh", type=float, default=1.0,
                         help="Drop entire vessel tracks whose average speed is below "
                              "this threshold in km/h (default: 1.0). "
