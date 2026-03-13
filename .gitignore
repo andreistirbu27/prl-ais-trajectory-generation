@@ -28,3 +28,5 @@ runs/*
 # Checkpoints
 *.pt
 *.pth
+docs/initial_talk_with_supervisor.txt
+docs/talk_2.txt
