@@ -3,41 +3,43 @@
 Transformer-based next-step prediction and synthetic maritime trajectory generation from AIS tracklines.
 
 ## Structure
-- `scripts/`   CLI scripts (preprocessing + training)
-- `src/`       reusable modules: data pipeline, model, metrics
-- `docs/`      supervisor meeting notes and reference papers
-- `data/`      datasets (not tracked)
-- `runs/`      training outputs / checkpoints (not tracked)
+- `scripts/`      CLI scripts (data preparation, training, visualization)
+- `src/`          reusable modules: data pipeline, model, metrics
+- `notebooks/`    exploratory notebooks
+- `docs/`         progress notes; `docs/references/` for papers and links
+- `data/`         datasets (not tracked)
+- `runs/`         training outputs / checkpoints (not tracked)
 
 ## Data Pipeline
 
 ```
 Raw AIS CSVs (marinecadastre.gov)
-    ↓  scripts/combine_days.py       # merge multi-day files, deduplicate
-    ↓  scripts/process_ais_data.py  # filter by vessel type, bbox, quality
+    ↓  scripts/prepare_data.py    # combine multi-day files, filter by type/bbox/quality
     →  data/processed/<name>_processed.csv
 ```
 
-### Combine multiple raw days
+### Prepare data (combine + filter)
 ```bash
-python3 scripts/combine_days.py data/raw/AIS_2024_03_26.csv \
+# Multiple day files — combine first, then filter:
+python3 scripts/prepare_data.py data/raw/AIS_2024_03_26.csv \
     data/raw/AIS_2024_03_27.csv data/raw/AIS_2024_03_28.csv \
-    --output data/raw/AIS_combined.csv
-```
-
-### Preprocess (audit log printed to stdout)
-```bash
-python3 scripts/process_ais_data.py data/raw/AIS_combined.csv \
     -o data/processed/AIS_combined_processed.csv
+
+# Single already-combined file:
+python3 scripts/prepare_data.py data/raw/AIS_mar.csv
+
+# Audit without writing output:
+python3 scripts/prepare_data.py data/raw/AIS_mar.csv --dry-run
 ```
 Keeps vessel types 60–89 (passenger/cargo/tanker), continental US bbox,
-min 50 points per track, max jump 5 km, max gap 60 min, border truncation filter.
+min 50 points per track, max jump 2 km, max gap 60 min, GPS median filter,
+border truncation filter.
 
 ## Training
 
 ```bash
 # Recommended configuration
-python3 scripts/train_ais_transformer.py \
+python3 scripts/train.py \
     --csv data/processed/AIS_combined_processed.csv \
     --epochs 40 --val_frac 0.15 \
     --seq_len 120 --stride 50 \
@@ -69,3 +71,15 @@ python3 scripts/train_ais_transformer.py \
 Plus vessel type embedding (8-dim, broadcast over all timesteps).
 
 Target per timestep: `[dlon_norm, dlat_norm]` (normalised displacement to next position).
+
+## Visualization
+
+```bash
+# Distribution map + 25 raw track samples:
+python3 scripts/visualize.py --csv data/processed/AIS_combined_processed.csv
+
+# Also generate model prediction panels:
+python3 scripts/visualize.py \
+    --csv data/processed/AIS_combined_processed.csv \
+    --checkpoint runs/ais_transformer/best.pt
+```
